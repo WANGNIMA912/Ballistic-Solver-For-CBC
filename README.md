@@ -186,11 +186,13 @@ r.getPitchLow();  r.getTimeLow();    // flat arc
 r.getPitchHigh(); r.getTimeHigh();   // lobbed arc
 ```
 
-All three bisections together need on the order of a few hundred transcendental evaluations — sub-millisecond per call, which is why `Main` can loop it 750 times as a smoke test.
+All three bisections together need on the order of a few hundred transcendental evaluations — a few microseconds per call, which is why `Main` can loop it 10,000 times as a smoke test.
 
 ---
 
 ## 4. Observed Problems In-Game
+
+> **Raw captures:** [refPic/README.md](refPic/README.md) — the six F3 entity snapshots behind this section, indexed by shot and tick, with the full field values.
 
 ### 4.1 Spawn offset (`unknownFix`) — unresolved
 
@@ -200,7 +202,7 @@ The value used is `unknownFix = -2.5`, i.e. an effective barrel length of $L = \
 
 Consequence: the model is systematically off by a constant amount that is independent of range, and the solver inherits that error.
 
-> **Status: unresolved.** See `refPic/` for the in-game entity dumps used while trying to pin it down.
+> **Status: unresolved.** See the [capture log](refPic/README.md) for the in-game entity dumps used while trying to pin it down.
 
 ### 4.2 Suspicion: the first tick is special
 
@@ -222,7 +224,7 @@ Each shot has three samples, taken one tick apart. **Sample 0 is the freshly spa
 
 ### 4.3 What the recordings actually show
 
-This resolves the first-tick question.
+This settles the integration rule — though not the initial condition.
 
 **Velocity recurrence** — holds to full double precision:
 
@@ -255,13 +257,13 @@ Measured, vertical shot:
 | 0 → 1 | 1.930088420 → 1.860787535 | 1.895437977 | 1.895437977 | -8.1e-13 |
 | 1 → 2 | 1.860787535 → 1.792179660 | 1.826483598 | 1.826483598 | -2.2e-15 |
 
-So the integration rule is **identical for the first tick and for every later tick**. The apparent anomaly has a simpler cause: the tick-0 velocity is not the result of a perfectly level shot.
+So the integration rule is **identical for the first tick and for every later tick**. What made the first tick look different is the *initial state*, not the rule.
 
-Its magnitude is $\lvert v_0\rvert = \sqrt{1.980048^2 + 0.050274^2} \approx 1.980687$ and its direction is about $-1.45°$ below horizontal — which is why its vertical component happens to sit near $-g$ (here $-1.0055\,g$). The horizontal component is *not* decayed yet, which confirms that this is the initial state and not a state that has already been integrated once.
+The recorded tick-0 motion is $(-1.980048,\ -0.050274,\ -5.9\times10^{-4})$: the horizontal component is undecayed (a full $1.980$), but the vertical component already sits about one gravity step low. The same frame's entity `Rotation` reads pitch $-0.0079°$, which would imply $v_y \approx -2.7\times10^{-4}$ — two orders of magnitude off. In other words, the spawn-time velocity does not match the spawn-time orientation.
 
 Because the first tick's displacement is the average of that velocity and the next one, it looks like neither $v_0$ nor $v_1$ — it lands exactly in between, which is what made it look like a separate rule.
 
-In other words the first displacement is not "speed times one tick"; it is $(v_0 + v_1)/2$, and it always has been.
+In other words the first displacement is not "speed times one tick"; it is $(v_0 + v_1)/2$, and it always has been. The remaining puzzle is why the tick-0 velocity is not what the barrel orientation implies.
 
 ### 4.4 Consequence for the solver
 
@@ -280,7 +282,7 @@ On the vertical axis the closed form and the step-by-step recurrence differ by e
 ## 5. Open Problems
 
 1. **`unknownFix` is still fitted, not derived.** The spawn rule needs to be read directly from the mod source or measured with a controlled harness (fixed barrel length, several distances, no terrain interaction).
-2. **Tick-0 launch direction is not exactly level.** The recorded spawn velocity is about $1.9807$ blocks/tick at $-1.45°$, so its vertical component lands near $-g$ by coincidence rather than by rule. Whether this comes from mount pitch calibration, a spawn-time velocity adjustment, or just an imprecise "level" setup is still open. It affects the initial condition, not the integration rule.
+2. **Tick-0 velocity disagrees with tick-0 rotation.** The horizontal shot's `Motion` is $1.980$ horizontally with $v_y = -0.0503$, while its `Rotation` pitch is $-0.0079°$ (implying $v_y \approx -2.7\times10^{-4}$): the vertical component is roughly one gravity step too low, while the horizontal one is undecayed. The integration rule is unaffected, but where that extra $-g$ comes from is not yet known.
 3. **High-arc solutions are ill-conditioned.** Near the maximum range $x(t)$ flattens out, so a 0.5 % model mismatch can move the impact height by tens of blocks. The low arc is well behaved; the high arc needs either a better model or a range guard.
 4. **No numerical guards.** If $H$ exceeds the asymptotic range, `acos` receives an argument outside $[-1, 1]$, returns `NaN`, and the first bisection loops forever (it has no iteration cap). A target at $H = 1600$ blocks with $v = 320$ blocks/s hangs the solver.
 
@@ -297,7 +299,7 @@ BallisticCal/
 │   ├── Main.java             # 10,000-iteration smoke test
 │   ├── Benchmark.java        # latency percentiles + numeric-search comparison
 │   └── recordAndVerify.py    # raw in-game samples + quick arithmetic checks
-├── refPic/                   # in-game entity dumps used while debugging
+├── refPic/                   # in-game entity dumps + capture log (refPic/README.md)
 └── README.md
 ```
 
