@@ -1,4 +1,3 @@
-
 public class calLib {
     public static result getResult(double horizon, double vertical, double barrel, double velocity, double drag, double gravity, double precise) {
         double temem;
@@ -10,10 +9,10 @@ public class calLib {
         double IniUpper = Math.acos(horizon * (1 - drag) / ((barrel + unknownFix) - (barrel + unknownFix) * drag + velocity * drag));
 //        System.out.println(Math.toDegrees(IniUpper));
 
-        double pl = 0;
-        double tl = 0;
-        double ph = 0;
-        double th = 0;
+        double pl;
+        double tl;
+        double ph;
+        double th;
 
         temem = IniUpper;
         double thisUp;
@@ -37,7 +36,7 @@ public class calLib {
                 IniUpper = mid;
 //                System.out.println("Secondary boundary attempted: " + test);
 //                System.out.println(Math.toDegrees(IniUpper));
-                dumb=data;
+                dumb = data;
                 break;
             } else if (data2 > data) {
                 thisLow = mid;
@@ -47,8 +46,8 @@ public class calLib {
                 test++;
             }
         }
-        if (dumb<vertical){
-            return new result(0,0,0,0);
+        if (dumb < vertical) {
+            return new result(0, 0, 0, 0);
         }
 
         thisUp = IniUpper;

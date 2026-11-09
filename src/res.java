@@ -1,4 +1,3 @@
-import javax.lang.model.type.NullType;
 
 public class res extends result{
 
