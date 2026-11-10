@@ -1,0 +1,338 @@
+# BallisticCal
+
+> A research log for a **closed-form, tick-discrete ballistic solver** built for
+> [Create Big Cannons](https://github.com/Cannoneers-of-Create/CreateBigCannons) (Minecraft 1.21.1 / NeoForge).
+
+The question this project tries to answer is simple to state and awkward to compute:
+
+> *Given a target at horizontal distance $H$ and height difference $V$, at what elevation must the barrel be set?*
+
+In-game this is normally solved by walking shots onto the target. The goal here is to compute it directly.
+
+---
+
+## Performance at a glance
+
+A single solve costs a few microseconds — fast enough to recompute a whole firing table every tick.
+
+| metric | value |
+| --- | --- |
+| mean solve time | **3.5 µs** |
+| median / p99 | 3.5 µs / 4.3 µs |
+| throughput | **~280,000 solves/s** |
+| 10,000 random targets | **36 ms** |
+| share of one 60 FPS frame | ~1/4,760 |
+| vs. 40-step numeric simulation | **2.0× faster** |
+
+Three bisections over closed-form expressions — the solver never steps the simulation, so the cost does not grow with flight time.
+
+Measured with 10,000 random horizontal distances $H \in [530, 1230]$ blocks, $V = 30$, barrel `10`, `v = 320` blocks/s, `d = 0.99`, `g = 0.05`, tolerance `0.005`; JDK 25, single thread, after JIT warm-up. Reproduce with:
+
+```bash
+javac -d out src/*.java
+java -cp out Benchmark
+```
+
+The bare `Main` loop, without explicit warm-up, reports ~3.8 µs per solve.
+
+---
+
+## 1. Research Background
+
+Big cannon projectiles in CBC are **not** simulated with a closed-form parabola. They are integrated once per game tick:
+
+- horizontal velocity is multiplied by a drag factor each tick,
+- vertical velocity is multiplied by the same factor **and** reduced by a gravity constant,
+- position is advanced once per tick.
+
+The mechanism, stated in the form used throughout this project:
+
+| axis | per-tick update |
+| --- | --- |
+| horizontal | $v_x \leftarrow v_x \cdot d$ |
+| vertical | $v_y \leftarrow v_y \cdot d - g$ |
+
+with the working values
+
+$$
+d = 0.99,\qquad g = 0.05\ \text{blocks/tick}^2
+$$
+
+and $20$ ticks per second (input speeds are given in blocks/s and divided by 20 internally).
+
+Because velocity decays geometrically, the trajectory is **not** a parabola and has **no** simple inverse. Trial-and-error aiming is slow, wastes ammunition, and is unreliable at long range where the flight time is tens of seconds.
+
+Two further complications make the problem interesting:
+
+1. The projectile does not spawn at the centre of the last barrel block — there is an offset that must be modelled.
+2. For any reachable target there are generally **two** firing solutions (a flat one and a lobbed one), and both are wanted: the flat one for direct fire, the lobbed one for shooting over terrain.
+
+---
+
+## 2. Initial Numerical Model
+
+### 2.1 Discrete motion law
+
+Writing $v_0$ for the muzzle speed component and stepping tick by tick:
+
+$$
+v_{n} = d^{\,n} v_0 \qquad \text{(horizontal)}
+$$
+
+$$
+v_{y,n} = d^{\,n} v_{y0} - g\,\frac{d^{\,n}-1}{d-1} \qquad \text{(vertical)}
+$$
+
+The position is advanced with the **average** of the velocity before and after the update — this is what `pos += v + 0.5 * a` in game means:
+
+$$
+\Delta p_n = \frac{v_n + v_{n+1}}{2} = k\,v_n \quad\text{(horizontal)},\qquad
+\Delta y_n = k\,v_{y,n} - \frac{g}{2} \quad\text{(vertical)},\qquad k = \frac{1+d}{2}
+$$
+
+Both velocity sequences are geometric; the vertical one is a geometric sequence with a constant forcing term, which is why it is described as a *mixed arithmetic / geometric* series.
+
+### 2.2 Horizontal: "given speed and distance, return time"
+
+Summing the geometric series $v_0 d,\; v_0 d^2,\; \dots,\; v_0 d^t$:
+
+$$
+x(t) = v_0\,k\,\frac{1-d^{\,t}}{1-d}
+$$
+
+Inverted for time:
+
+$$
+t(x) = \frac{\ln\!\left(1 - \dfrac{x\,(1-d)}{v_0\,k}\right)}{\ln d}
+$$
+
+### 2.3 Vertical: "given speed and time, return height"
+
+Summing the velocity recurrence:
+
+$$
+y(t) = k\,A\,v_{y0} + \frac{k\,g\,(A - t)}{1-d} - \frac{g\,t}{2},
+\qquad A = \frac{1-d^{\,t}}{1-d}
+$$
+
+### 2.4 Closed forms as utilities
+
+These two inversions are exposed directly in `calLib` as standalone helpers, because they are useful on their own (e.g. computing time-of-flight for a known distance):
+
+| function | input | output |
+| --- | --- | --- |
+| `getDist(v, t, d)` | initial speed, ticks | horizontal distance |
+| `getVertDist(v, t, d, g)` | initial vertical speed, ticks | height reached |
+| `getTick(s, d, v)` | distance, drag, speed | ticks to travel that distance |
+
+With the solver these are mostly redundant, but they were the first thing written and they made the geometry checkable by hand.
+
+---
+
+## 3. Algorithm Design
+
+### 3.1 Muzzle geometry
+
+The projectile starts at
+
+$$
+(x_0,\, y_0) = \big(L\cos\theta,\; L\sin\theta\big),
+\qquad L = \texttt{barrel} + \texttt{unknownFix}
+$$
+
+where `unknownFix = -2.5` is an empirical correction for the spawn offset (see §4.1).
+
+The horizontal distance still to be covered is therefore $H - L\cos\theta$, which is substituted into $t(x)$ above.
+
+### 3.2 Step 1 — firing bounds
+
+- **Lower bound**: the straight line to the target, $\theta_{\min} = \arctan(V/H)$. No negative-gravity shells are modelled, so this is a hard floor.
+- **Upper bound**: the elevation at which the *asymptotic* horizontal range still reaches $H$. Letting $t \to \infty$:
+
+$$
+x_{\infty}(\theta) = \left(L + \frac{v k}{1-d}\right)\cos\theta
+$$
+
+Requiring $x_{\infty} \ge H$ gives
+
+$$
+\theta_{\max} = \arccos\!\left(\frac{H\,(1-d)}{L\,(1-d) + v\,k}\right)
+$$
+
+Any elevation above this can never reach $H$, no matter how long it flies.
+
+### 3.3 Step 2 — apex test (reachability)
+
+For a fixed $H$, the landing height $V(\theta)$ is a **single-peaked** function of elevation: it rises to a maximum, then falls back. The peak is located by a **golden-section search** over $[\theta_{\min}, \theta_{\max}]$, which needs one function evaluation per iteration and has no finite-difference step size to tune.
+
+If the peak height is below the target height, the target is unreachable and the solver returns a zeroed result immediately:
+
+```java
+if (dumb < vertical) return new result(0, 0, 0, 0);
+```
+
+This is what makes the remaining two bisections safe: on either side of the peak, $V(\theta)$ is monotonic.
+
+### 3.4 Steps 3 and 4 — the two arcs
+
+- **Low arc**: bisection on $[\theta_{\min},\, \theta_{\text{apex}}]$, where $V(\theta)$ is increasing.
+- **High arc**: bisection on $[\theta_{\text{apex}},\, \theta_{\max}]$, where $V(\theta)$ is decreasing.
+
+Both use the same residual:
+
+$$
+\text{cannon}(\theta) = L\sin\theta + y\big(t(\theta)\big) - V
+$$
+
+and stop when $|\text{cannon} - V| < \texttt{precise}$ (default `0.005`) or after 100 iterations.
+
+The result object carries both solutions and both flight times:
+
+```java
+result r = calLib.getResult(H, V, barrel, speed, drag, gravity, precise);
+r.getPitchLow();  r.getTimeLow();    // flat arc
+r.getPitchHigh(); r.getTimeHigh();   // lobbed arc
+```
+
+All three bisections together need on the order of a few hundred transcendental evaluations — a few microseconds per call, which is why `Main` can loop it 10,000 times as a smoke test.
+
+---
+
+## 4. Observed Problems In-Game
+
+> **Raw captures:** [refPic/README.md](refPic/README.md) — the six F3 entity snapshots behind this section, indexed by shot and tick, with the full field values.
+
+### 4.1 Spawn offset (`unknownFix`) — unresolved
+
+The projectile does not spawn at the centre of the last barrel block; its spawn position is offset by an amount that is not exposed anywhere in-game.
+
+The value used is `unknownFix = -2.5`, i.e. an effective barrel length of $L = \texttt{barrel} - 2.5$. This is roughly consistent with the known CBC spawn behaviour of backing the projectile off by ~2 blocks from the muzzle, plus half a block of centring, but it has **not** been derived — it is fitted.
+
+Consequence: the model is systematically off by a constant amount that is independent of range, and the solver inherits that error.
+
+> **Status: unresolved.** See the [capture log](refPic/README.md) for the in-game entity dumps used while trying to pin it down.
+
+### 4.2 Suspicion: the first tick is special
+
+Because the residual was not explained by the spawn offset alone, the next suspect was the **first tick**. The hypothesis was that the projectile's very first movement step is computed differently from all later steps (for example, not yet having a previous velocity to average with).
+
+To test it, `src/recordAndVerify.py` stores raw samples taken in-game for two shots of the same shell, with the same propellant charge and the same barrel length:
+
+- **horizontal shot** — barrel level, shell fired along $-X$,
+- **vertical shot** — barrel pointing straight up.
+
+Each shot has three samples, taken one tick apart. **Sample 0 is the freshly spawned projectile, before it has moved at all** — this matters, because the tick-0 position is the spawn position, not a post-integration position.
+
+| sample | contents |
+| --- | --- |
+| `xh, yh, zh` | position (horizontal shot) |
+| `xhm, yhm, zhm` | motion / delta-movement (horizontal shot) |
+| `xv, yv, zv` | position (vertical shot) |
+| `xvm, yvm, zvm` | motion / delta-movement (vertical shot) |
+
+### 4.3 What the recordings actually show
+
+This settles the integration rule — though not the initial condition.
+
+**Velocity recurrence** — holds to full double precision:
+
+| relation | expected | recorded | error |
+| --- | --- | --- | --- |
+| $v_{y,1} = 0.99\,v_{y,0} - 0.05$ (horizontal shot) | `-0.0997712852356408` | `-0.0997712852356408` | `0.00e+0` |
+| $v_{y,2} = 0.99\,v_{y,1} - 0.05$ | `-0.1487735723832844` | `-0.1487735723832844` | `0.00e+0` |
+| $v_{y,1} = 0.99\,v_{y,0} - 0.05$ (vertical shot) | `1.8607875353551253` | `1.8607875353551253` | `0.00e+0` |
+| $\lvert v_1\rvert / \lvert v_0\rvert$ (horizontal component) | `0.99` | `0.9900000189` | `~2e-8` |
+
+**Displacement between consecutive samples** — this is the answer to the "first tick" question:
+
+$$
+\boxed{\;\Delta \vec{p}_{\,n \to n+1} \;=\; \frac{\vec v_n + \vec v_{n+1}}{2}\;}
+$$
+
+i.e. the distance moved is the **average of the velocity at the start and at the end of the tick** — trapezoidal integration, equivalent to `pos += v + 0.5 * a`.
+
+Measured, horizontal shot:
+
+| step | horizontal speed | $v_y$ | measured $\Delta p$ (horiz) | measured $\Delta p$ (y) | mean speed | mean $v_y$ | residual |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 → 1 | 1.980048308 → 1.960247862 | -0.050274025 → -0.099771285 | 1.970148067 | -0.075022655 | 1.970148085 | -0.075022655 | -1.8e-8 / 1.2e-15 |
+| 1 → 2 | 1.960247862 → 1.940645346 | -0.099771285 → -0.148773572 | 1.950446585 | -0.124272429 | 1.950446604 | -0.124272429 | -2.0e-8 / 5.0e-16 |
+
+Measured, vertical shot:
+
+| step | $v_y$ | measured $\Delta p$ (y) | mean $v_y$ | residual |
+| --- | --- | --- | --- | --- |
+| 0 → 1 | 1.930088420 → 1.860787535 | 1.895437977 | 1.895437977 | -8.1e-13 |
+| 1 → 2 | 1.860787535 → 1.792179660 | 1.826483598 | 1.826483598 | -2.2e-15 |
+
+So the integration rule is **identical for the first tick and for every later tick**. What made the first tick look different is the *initial state*, not the rule.
+
+The recorded tick-0 motion is $(-1.980048,\ -0.050274,\ -5.9\times10^{-4})$: the horizontal component is undecayed (a full $1.980$), but the vertical component already sits about one gravity step low. The same frame's entity `Rotation` reads pitch $-0.0079°$, which would imply $v_y \approx -2.7\times10^{-4}$ — two orders of magnitude off. In other words, the spawn-time velocity does not match the spawn-time orientation.
+
+Because the first tick's displacement is the average of that velocity and the next one, it looks like neither $v_0$ nor $v_1$ — it lands exactly in between, which is what made it look like a separate rule.
+
+In other words the first displacement is not "speed times one tick"; it is $(v_0 + v_1)/2$, and it always has been. The remaining puzzle is why the tick-0 velocity is not what the barrel orientation implies.
+
+### 4.4 Model correction (applied)
+
+The solver originally advanced the position with the *new* velocity only (`pos += v_new`). Against the game's trapezoidal step that meant:
+
+- **horizontal:** a constant factor $d/k = 1.98/1.99 \approx 0.995$ — 0.5 % short per tick, about 0.6 blocks of range over a 100-tick flight;
+- **vertical:** exactly one gravity step short per tick, accumulating as $g\,t$.
+
+Both are fixed: the closed forms in §2 use the trapezoidal step, and the firing bounds use $k$ instead of $d$.
+
+Verified by re-solving the same targets and replaying each solution through a tick-by-tick integrator of the same model:
+
+| target | before (residual) | after (residual) |
+| --- | --- | --- |
+| H = 530, V = 30, low arc | −0.79 | **−0.004** |
+| H = 1000, V = 30, low arc | −2.36 | **−0.007** |
+| H = 1000, V = 30, high arc | +40.1 | **−0.002** |
+
+The high arc benefits most: near maximum range a small model error moves the impact point by tens of blocks.
+
+---
+
+## 5. Open Problems
+
+1. **`unknownFix` is still fitted, not derived.** The spawn rule needs to be read directly from the mod source or measured with a controlled harness (fixed barrel length, several distances, no terrain interaction).
+2. **Tick-0 velocity disagrees with tick-0 rotation.** The horizontal shot's `Motion` is $1.980$ horizontally with $v_y = -0.0503$, while its `Rotation` pitch is $-0.0079°$ (implying $v_y \approx -2.7\times10^{-4}$): the vertical component is roughly one gravity step too low, while the horizontal one is undecayed. The integration rule is unaffected, but where that extra $-g$ comes from is not yet known.
+3. **High-arc solutions are ill-conditioned.** Near the maximum range $x(t)$ flattens out, so a 0.5 % model mismatch can move the impact height by tens of blocks. The low arc is well behaved; the high arc needs either a better model or a range guard.
+4. ~~No numerical guards.~~ **Fixed.** Out-of-range targets now return a zeroed result instead of driving `acos` into `NaN`, every search carries an iteration cap, and the apex search is a golden-section search rather than a finite-difference probe.
+
+---
+
+## 6. Repository Layout
+
+```text
+BallisticCal/
+├── src/
+│   ├── calLib.java           # trapezoidal closed form, golden-section apex, two bisections
+│   ├── result.java           # (pitchLow, timeLow, pitchHigh, timeHigh)
+│   ├── res.java              # trivial subclass, unused
+│   ├── Main.java             # 10,000-iteration smoke test
+│   ├── Benchmark.java        # latency percentiles + numeric-search comparison
+│   └── recordAndVerify.py    # raw in-game samples + quick arithmetic checks
+├── refPic/                   # in-game entity dumps + capture log (refPic/README.md)
+└── README.md
+```
+
+## 7. Running
+
+```bash
+javac -d out src/*.java
+java -cp out Main        # 10,000-iteration smoke test
+java -cp out Benchmark   # latency percentiles + comparison
+```
+
+For the sample checks:
+
+```bash
+python src/recordAndVerify.py
+```
+
+## 8. References
+
+- Create Big Cannons — `rbasamoyai.createbigcannons.munitions.AbstractCannonProjectile`, the per-tick integration this model reproduces.
+- CBC projectile properties are data-driven (`munition_properties/projectiles/*.json`), where `drag` and `gravity` are the two numbers this project parameterises.

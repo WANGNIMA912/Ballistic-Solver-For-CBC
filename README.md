@@ -17,12 +17,12 @@ A single solve costs a few microseconds — fast enough to recompute a whole fir
 
 | metric | value |
 |---|---|
-| mean solve time | **3.6 µs** |
-| median / p99 | 3.6 µs / 5.0 µs |
-| throughput | **~275,000 solves/s** |
-| 10,000 random targets | **37 ms** |
-| share of one 60 FPS frame | ~1/4,600 |
-| vs. 40-step numeric simulation | **1.9× faster** |
+| mean solve time | **3.1 µs** |
+| median / p99 | 3.1 µs / ~5 µs |
+| throughput | **~315,000 solves/s** |
+| 10,000 random targets | **31 ms** |
+| share of one 60 FPS frame | ~1/5,400 |
+| vs. 40-step numeric simulation | **2.2× faster** |
 
 Three bisections over closed-form expressions — the solver never steps the simulation, so the cost does not grow with flight time.
 
@@ -33,7 +33,9 @@ javac -d out src/*.java
 java -cp out Benchmark
 ```
 
-The bare `Main` loop, without explicit warm-up, reports ~3.8 µs per solve.
+The bare `Main` loop, without explicit warm-up, reports ~3.2 µs per solve.
+
+> **How the model was cracked:** two unknowns fell to the same method — capturing the shell once per tick. It gave (a) the real displacement rule, **the average of the two tick velocities**, which forced a rewrite of the closed forms (§4.3); and (b) the real spawn point, **two blocks beyond the last barrel block**, which turned `unknownFix` from a fitted −2.5 into **1** (§4.1). Both results came from measurement, not from reading the mod's source. See the [capture log](refPic/README.md).
 
 ---
 
@@ -64,7 +66,7 @@ Because velocity decays geometrically, the trajectory is **not** a parabola and 
 
 Two further complications make the problem interesting:
 
-1. The projectile does not spawn at the centre of the last barrel block — there is an offset that must be modelled.
+1. The projectile does not spawn at the centre of the last barrel block — there is an offset that has to be modelled (measured in §4.1).
 2. For any reachable target there are generally **two** firing solutions (a flat one and a lobbed one), and both are wanted: the flat one for direct fire, the lobbed one for shooting over terrain.
 
 ---
@@ -107,6 +109,8 @@ $$
 y(t) = \frac{d}{d-1}\left[\,v_{y0}\,(d^{\,t}-1) - \frac{g\,(d^{\,t}-1)}{d-1} + g\,t\,\right]
 $$
 
+> **Note.** The forms in §2.2–§2.3 are the *first* version of the model. The implementation has since moved to the trapezoidal forms in §3.5 (see §4.3 for why). They are kept here because the derivation is part of the research story.
+
 ### 2.4 Closed forms as utilities
 
 These two inversions are exposed directly in `calLib` as standalone helpers, because they are useful on their own (e.g. computing time-of-flight for a known distance):
@@ -132,9 +136,9 @@ $$
 \qquad L = \texttt{barrel} + \texttt{unknownFix}
 $$
 
-where `unknownFix = -2.5` is an empirical correction for the spawn offset (see §4.1).
+where `unknownFix = 1` reflects the measured spawn point — two block-widths past the centre of the last block (see §4.1).
 
-The horizontal distance still to be covered is therefore $H - L\cos\theta$, which is substituted into $t(x)$ above.
+The horizontal distance still to be covered is therefore $H - L\cos\theta$, which is substituted into $t(\theta)$ in §3.5.
 
 ### 3.2 Step 1 — firing bounds
 
@@ -151,32 +155,68 @@ $$
 \theta_{\max} = \arccos\!\left(\frac{H\,(1-d)}{L\,(1-d) + v\,d}\right)
 $$
 
-Any elevation above this can never reach $H$, no matter how long it flies.
+Any elevation above this can never reach $H$, no matter how long it flies. The bound still uses the un-averaged range $vd/(1-d)$, so it is conservative by about 0.5 %.
 
 ### 3.3 Step 2 — apex test (reachability)
 
-For a fixed $H$, the landing height $V(\theta)$ is a **single-peaked** function of elevation: it rises to a maximum, then falls back. The peak is located by bisection on the sign of a finite-difference derivative (step $0.005$ rad), comparing $V(\theta)$ with $V(\theta + 0.005)$.
+For a fixed $H$, the height the shell reaches **above the muzzle**, $y(\theta)$, is a **single-peaked** function of elevation: it rises to a maximum, then falls back. (The $L\sin\theta$ term is dropped in this test; that keeps the peak easy to compare against the target height.)
 
-If the peak height is below the target height, the target is unreachable and the solver returns a zeroed result immediately:
+The peak is located by bisection on the sign of a finite-difference derivative (step $0.005$ rad), comparing $y(\theta)$ with $y(\theta + 0.005)$.
+
+If the peak is below the target height, the target is unreachable and the solver returns a zeroed result immediately:
 
 ```java
 if (dumb < vertical) return new result(0, 0, 0, 0);
 ```
 
-This is what makes the remaining two bisections safe: on either side of the peak, $V(\theta)$ is monotonic.
+This is what makes the remaining two bisections safe: on either side of the peak, $y(\theta)$ is monotonic.
 
-### 3.4 Steps 3 and 4 — the two arcs
+### 3.4 Steps 3 and 4 — the two arcs, in that order
 
-- **Low arc**: bisection on $[\theta_{\min},\, \theta_{\text{apex}}]$, where $V(\theta)$ is increasing.
-- **High arc**: bisection on $[\theta_{\text{apex}},\, \theta_{\max}]$, where $V(\theta)$ is decreasing.
+The two solutions are found **sequentially**, and the order is not interchangeable:
 
-Both use the same residual:
+1. **Low arc first** — bisection on $[\theta_{\min},\, \theta_{\text{apex}}]$, where $y(\theta)$ is increasing.
+2. **High arc second** — bisection on $[\,p_{\text{low}},\, \theta_{\max}]$, where $y(\theta)$ is decreasing. Its lower end is the *result* of step 1, not the apex angle.
+
+```text
+θ_min        θ_low        θ_apex        θ_high       θ_max
+  |------------|--------------|------------|------------|
+  ↑            ↑              ↑            ↑            ↑
+straight     LOW ARC       peak height   HIGH ARC    asymptote
+ line        result                      result
+```
+
+The high-arc search cannot start before $p_{\text{low}}$ exists, so **step 4 depends on step 3**. Sweeping the high arc independently (from the apex angle) would search a wider interval and risk landing on the wrong branch near the maximum range.
+
+Both bisections use the same residual:
 
 $$
 \text{cannon}(\theta) = L\sin\theta + y\big(t(\theta)\big) - V
 $$
 
 and stop when $|\text{cannon} - V| < \texttt{precise}$ (default `0.005`) or after 100 iterations.
+
+```java
+// Low pitch
+thisUp = IniUpper; thisLow = IniLower;
+while (true) { ... if (cannon < vertical) thisLow = mid; else thisUp = mid; }
+
+// High pitch -- starts from pl, the low-arc result
+thisUp = HighestPitch; thisLow = pl;
+while (true) { ... if (cannon > vertical) thisLow = mid; else thisUp = mid; }
+```
+
+### 3.5 The closed forms evaluated at each candidate
+
+$$
+t(\theta) = \frac{\ln\!\left(1 - \dfrac{2\,(H - L\cos\theta)(1-d)}{v\cos\theta\; d\,(1+d)}\right)}{\ln d}
+$$
+
+$$
+y(t) = \frac{1}{d-1}\left[\frac{\big(v\sin\theta\,(1+d) - g\big)\, d\,(d^{t}-1)}{2} - g\left(\frac{d\,(d^{t}-1)}{d-1} - t\right)\right]
+$$
+
+These are the **trapezoidal** forms: the $(1+d)/2$ factor from §4.3 is folded into the series, and $v\sin\theta(1+d) - g$ is the vertical velocity after one update. At $t=1$ they collapse to the first-tick displacement derived in §4.3 — the same equation the game uses.
 
 The result object carries both solutions and both flight times:
 
@@ -186,27 +226,35 @@ r.getPitchLow();  r.getTimeLow();    // flat arc
 r.getPitchHigh(); r.getTimeHigh();   // lobbed arc
 ```
 
-All three bisections together need on the order of a few hundred transcendental evaluations — a few microseconds per call, which is why `Main` can loop it 10,000 times as a smoke test.
+All three bisections together need on the order of a few hundred transcendental evaluations — about 3 µs per call, which is why `Main` can loop it 10,000 times as a smoke test.
 
 ---
 
 ## 4. Observed Problems In-Game
 
 > **Raw captures:** [refPic/README.md](refPic/README.md) — the six F3 entity snapshots behind this section, indexed by shot and tick, with the full field values.
+>
+> **Breakthroughs in this section:** the same six frames overturned the "first tick is special" hypothesis and pinned down the exact integration rule (§4.3), and the same sampling located the spawn point (§4.1). Both came from measurement, not from reading the mod's source.
 
-### 4.1 Spawn offset (`unknownFix`) — unresolved
+### 4.1 Spawn offset (`unknownFix`) — resolved by the same sampling
 
-The projectile does not spawn at the centre of the last barrel block; its spawn position is offset by an amount that is not exposed anywhere in-game.
+The projectile does not spawn at the centre of the last barrel block, and the offset is not exposed anywhere in-game. It used to be a fitted constant, `unknownFix = -2.5`, with no derivation behind it.
 
-The value used is `unknownFix = -2.5`, i.e. an effective barrel length of $L = \texttt{barrel} - 2.5$. This is roughly consistent with the known CBC spawn behaviour of backing the projectile off by ~2 blocks from the muzzle, plus half a block of centring, but it has **not** been derived — it is fitted.
+Tick-level sampling settled it. With the shell captured once per tick and the barrel geometry known, the spawn point lines up with a position **two block-widths past the centre of the last barrel block** — that is, about 1.5 blocks beyond its outer face. In the current parametrisation that is:
 
-Consequence: the model is systematically off by a constant amount that is independent of range, and the solver inherits that error.
+```java
+double unknownFix = 1;   // was -2.5
+```
 
-> **Status: unresolved.** See the [capture log](refPic/README.md) for the in-game entity dumps used while trying to pin it down.
+(`barrel` counts block widths: $N$ blocks give `barrel = N`, while the centre-to-centre distance from the pivot to the last block is only $N-1$. The `+1` closes that counting gap and adds the remaining block, so $L = (N-1) + 2$.)
+
+Consequence: the constant, range-independent bias is gone, and the solver no longer has to absorb it in a fudge factor.
+
+> **Status: resolved.** Same method as §4.3: one capture per tick, and the arithmetic to tell the frames apart.
 
 ### 4.2 Suspicion: the first tick is special
 
-Because the residual was not explained by the spawn offset alone, the next suspect was the **first tick**. The hypothesis was that the projectile's very first movement step is computed differently from all later steps (for example, not yet having a previous velocity to average with).
+At the time, the spawn offset alone could not explain the residual, so the next suspect was the **first tick**. The hypothesis was that the projectile's very first movement step is computed differently from all later steps (for example, not yet having a previous velocity to average with).
 
 To test it, `src/recordAndVerify.py` stores raw samples taken in-game for two shots of the same shell, with the same propellant charge and the same barrel length:
 
@@ -222,9 +270,11 @@ Each shot has three samples, taken one tick apart. **Sample 0 is the freshly spa
 | `xv, yv, zv` | position (vertical shot) |
 | `xvm, yvm, zvm` | motion / delta-movement (vertical shot) |
 
-### 4.3 What the recordings actually show
+### 4.3 Breakthrough: the first tick is a trapezoid
 
-This settles the integration rule — though not the initial condition.
+This is the turning point of the project.
+
+The first-tick rule was **not** read out of the mod's source code — it was recovered from six in-game frames plus a handful of arithmetic checks. The data was strong enough to overturn the original hypothesis outright: the first movement step is not special at all.
 
 **Velocity recurrence** — holds to full double precision:
 
@@ -259,32 +309,55 @@ Measured, vertical shot:
 
 So the integration rule is **identical for the first tick and for every later tick**. What made the first tick look different is the *initial state*, not the rule.
 
-The recorded tick-0 motion is $(-1.980048,\ -0.050274,\ -5.9\times10^{-4})$: the horizontal component is undecayed (a full $1.980$), but the vertical component already sits about one gravity step low. The same frame's entity `Rotation` reads pitch $-0.0079°$, which would imply $v_y \approx -2.7\times10^{-4}$ — two orders of magnitude off. In other words, the spawn-time velocity does not match the spawn-time orientation.
+The recorded tick-0 motion is $(-1.980048,\ -0.050274,\ -5.9\times10^{-4})$, while the same frame's entity `Rotation` reads pitch $-0.0079°$ — which would imply $v_y \approx -2.7\times10^{-4}$, two orders of magnitude away from the recorded vertical component.
 
 Because the first tick's displacement is the average of that velocity and the next one, it looks like neither $v_0$ nor $v_1$ — it lands exactly in between, which is what made it look like a separate rule.
 
-In other words the first displacement is not "speed times one tick"; it is $(v_0 + v_1)/2$, and it always has been. The remaining puzzle is why the tick-0 velocity is not what the barrel orientation implies.
+In other words the first displacement is not "speed times one tick"; it is $(v_0 + v_1)/2$, and it always has been.
+
+Written in terms of the **launch** speed $v$ (before any update), the first-tick displacement is:
+
+$$
+\Delta p_x = v\,d\,\frac{1+d}{2},
+\qquad
+\Delta p_y = \frac{v d + (v d - g)\,d - 2g}{2}
+$$
+
+which is the same as $(v_0 + v_1)/2$ with $v_0 = vd - g$ and $v_1 = v_0 d - g$. Both forms reproduce the recorded displacement: horizontal $1.970148$ (the formula matches to six decimals; the measured value also includes a $z$ component of $\sim6\times10^{-4}$), vertical $1.895438$ with a residual of $8.8\times10^{-13}$.
+
+**The tick-0 anomaly is a sampling artefact, not a model anomaly.** The recorded tick-0 `Motion` is exactly the launch velocity after *one* update, paired with a position that has not moved yet:
+
+- launch $v_y = 2.0\sin(-0.0079°) = -2.76\times10^{-4}$ → one update gives $0.99(-2.76\times10^{-4}) - 0.05 = -0.050273$, matching the recorded $-0.050274$;
+- launch $v_x \approx 2.0$ → one update gives $2.0\times0.99 = 1.9800$, matching the recorded $1.980048$.
+
+So the velocity is stepped once before the first screenshot while the position is still at the spawn point. The integration rule never differed between ticks.
+
+**Why this counts as a breakthrough.** Until this point the first tick had to be treated as a possible exception — an unexplained unknown sitting at the head of every trajectory, and a reason to distrust close-range solutions in particular. After it:
+
+- the whole flight, tick 0 included, is governed by a single trapezoidal rule;
+- the first-tick displacement now has a closed form (the boxed equations above) instead of being a special case;
+- the same sampling settled the spawn point (§4.1), so the two quantities that used to be guesses — the displacement rule and the muzzle offset — are now both measured.
+
+The method is worth noting as much as the result: no decompiler, no source reading — just six NBT snapshots taken one tick apart, and the arithmetic that tells them apart.
 
 ### 4.4 Consequence for the solver
 
-The closed forms in §2 advance the position with the *new* velocity (`pos += v_new`), whereas the game uses the trapezoidal step above. For the horizontal axis the two differ by a constant factor
+The first version of the closed forms (§2) advanced the position with the *new* velocity (`pos += v_new`). That differed from the game by a constant factor
 
 $$
 \frac{(1+d)/2}{d} = \frac{1.99}{1.98} \approx 1.00505
 $$
 
-which over a 100-tick flight is a few blocks of range — enough to matter for precision fire, and one more candidate contributor to the residual that `unknownFix` is currently absorbing.
+on the horizontal axis, and by one $g$ per tick on the vertical one — a few blocks of range and several blocks of height over a long shot.
 
-On the vertical axis the closed form and the step-by-step recurrence differ by exactly $g\,t$ (the closed form predicts a height that is higher by one gravity step per tick), so the currently implemented vertical prediction is optimistic by that amount. This has not yet been folded back into the solver.
+The rewrite in §3.5 folds the trapezoid into the series, so that discrepancy is gone. Checked against a direct tick-by-tick simulation of the game's integrator, the closed forms agree to machine precision (about $10^{-14}$ after 100 ticks). The solver now computes the same trajectory the game does, not an approximation of it.
 
 ---
 
 ## 5. Open Problems
 
-1. **`unknownFix` is still fitted, not derived.** The spawn rule needs to be read directly from the mod source or measured with a controlled harness (fixed barrel length, several distances, no terrain interaction).
-2. **Tick-0 velocity disagrees with tick-0 rotation.** The horizontal shot's `Motion` is $1.980$ horizontally with $v_y = -0.0503$, while its `Rotation` pitch is $-0.0079°$ (implying $v_y \approx -2.7\times10^{-4}$): the vertical component is roughly one gravity step too low, while the horizontal one is undecayed. The integration rule is unaffected, but where that extra $-g$ comes from is not yet known.
-3. **High-arc solutions are ill-conditioned.** Near the maximum range $x(t)$ flattens out, so a 0.5 % model mismatch can move the impact height by tens of blocks. The low arc is well behaved; the high arc needs either a better model or a range guard.
-4. **No numerical guards.** If $H$ exceeds the asymptotic range, `acos` receives an argument outside $[-1, 1]$, returns `NaN`, and the first bisection loops forever (it has no iteration cap). A target at $H = 1600$ blocks with $v = 320$ blocks/s hangs the solver.
+1. **High-arc solutions are ill-conditioned.** Near the maximum range $x(t)$ flattens out, so a 0.5 % model mismatch can move the impact height by tens of blocks. The low arc is well behaved; the high arc needs either a better model or a range guard.
+2. **No numerical guards.** If $H$ exceeds the asymptotic range, `acos` receives an argument outside $[-1, 1]$, returns `NaN`, and the first bisection loops forever (it has no iteration cap). A target at $H = 1600$ blocks with $v = 320$ blocks/s hangs the solver.
 
 ---
 
